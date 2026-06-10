@@ -1,1 +1,287 @@
+#include <WiFi.h>
+#include <WebServer.h>
 
+
+const char* ssid = "TP-Link_3480";
+const char* password = "SUA_SENHA_AQUI";
+
+#define BOMBA_RELE_PIN 14
+#define SOLO_SENSOR_PIN 34
+
+
+const int SENSOR_SECO = 4095;
+const int SENSOR_MOLHADO = 1800;
+
+
+float umidadeLiga = 40.0;
+float umidadeDesliga = 50.0;
+
+
+const int N_LEITURAS = 10;
+int bufferSolo[N_LEITURAS] = {0};
+int bufferIndex = 0;
+int totalLeituras = 0;
+
+
+WebServer server(80);
+
+int umidadeSoloAtual = 0;
+bool estadoBomba = false;
+
+unsigned long tempoAnterior = 0;
+const unsigned long intervaloLeitura = 1000;
+
+
+const char pagina[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Irrigação ESP32</title>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  text-align: center;
+  background: #0f172a;
+  color: white;
+  padding: 20px;
+}
+
+.card {
+  background: #1e293b;
+  padding: 20px;
+  margin: 20px auto;
+  border-radius: 12px;
+  max-width: 400px;
+}
+
+h1 {
+  color: #38bdf8;
+}
+
+.valor {
+  font-size: 42px;
+  font-weight: bold;
+  color: #22c55e;
+}
+
+.status {
+  font-size: 32px;
+  font-weight: bold;
+}
+
+.ligada {
+  color: #22c55e;
+}
+
+.desligada {
+  color: #ef4444;
+}
+
+input {
+  width: 80px;
+  padding: 10px;
+  font-size: 18px;
+  text-align: center;
+  border-radius: 8px;
+  border: none;
+}
+
+button {
+  padding: 10px 20px;
+  font-size: 16px;
+  border-radius: 8px;
+  border: none;
+  background: #38bdf8;
+  color: white;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #0284c7;
+}
+</style>
+</head>
+
+<body>
+
+<h1>🌱 Sistema de Irrigação</h1>
+
+<div class="card">
+  <h2>Umidade do Solo</h2>
+  <div id="umidade" class="valor">--%</div>
+</div>
+
+<div class="card">
+  <h2>Status da Bomba</h2>
+  <div id="bomba" class="status desligada">--</div>
+</div>
+
+<div class="card">
+  <h2>Configuração</h2>
+
+  <p>Ligar bomba em:</p>
+  <input type="number" id="liga" value="40"> %
+
+  <p>Desligar bomba em:</p>
+  <input type="number" id="desliga" value="50"> %
+
+  <br><br>
+  <button onclick="salvar()">Salvar</button>
+</div>
+
+<script>
+async function atualizar() {
+  const res = await fetch('/dados');
+  const data = await res.json();
+
+  document.getElementById('umidade').innerText = data.umidade + "%";
+
+  const bomba = document.getElementById('bomba');
+
+  if (data.bomba == 1) {
+    bomba.innerText = "LIGADA";
+    bomba.className = "status ligada";
+  } else {
+    bomba.innerText = "DESLIGADA";
+    bomba.className = "status desligada";
+  }
+
+  document.getElementById('liga').value = data.liga;
+  document.getElementById('desliga').value = data.desliga;
+}
+
+async function salvar() {
+  const liga = document.getElementById('liga').value;
+  const desliga = document.getElementById('desliga').value;
+
+  await fetch('/set?liga=' + liga + '&desliga=' + desliga);
+  alert("Configuração salva!");
+}
+
+setInterval(atualizar, 2000);
+atualizar();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+
+void atualizarSolo() {
+  int leitura = analogRead(SOLO_SENSOR_PIN);
+
+  bufferSolo[bufferIndex] = leitura;
+  bufferIndex = (bufferIndex + 1) % N_LEITURAS;
+
+  if (totalLeituras < N_LEITURAS) {
+    totalLeituras++;
+  }
+
+  long soma = 0;
+
+  for (int i = 0; i < totalLeituras; i++) {
+    soma += bufferSolo[i];
+  }
+
+  int media = soma / totalLeituras;
+
+  umidadeSoloAtual = map(media, SENSOR_SECO, SENSOR_MOLHADO, 0, 100);
+  umidadeSoloAtual = constrain(umidadeSoloAtual, 0, 100);
+}
+
+
+void controleIrrigacao() {
+  if (!estadoBomba && umidadeSoloAtual <= umidadeLiga) {
+    digitalWrite(BOMBA_RELE_PIN, LOW);
+    estadoBomba = true;
+
+    Serial.println("Bomba LIGADA");
+  }
+
+  if (estadoBomba && umidadeSoloAtual >= umidadeDesliga) {
+    digitalWrite(BOMBA_RELE_PIN, HIGH);
+    estadoBomba = false;
+
+    Serial.println("Bomba DESLIGADA");
+  }
+}
+
+
+void handleRoot() {
+  server.send_P(200, "text/html", pagina);
+}
+
+void handleDados() {
+  String json = "{";
+  json += "\"umidade\":" + String(umidadeSoloAtual) + ",";
+  json += "\"bomba\":" + String(estadoBomba ? 1 : 0) + ",";
+  json += "\"liga\":" + String(umidadeLiga, 0) + ",";
+  json += "\"desliga\":" + String(umidadeDesliga, 0);
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleSet() {
+  if (server.hasArg("liga")) {
+    umidadeLiga = server.arg("liga").toFloat();
+  }
+
+  if (server.hasArg("desliga")) {
+    umidadeDesliga = server.arg("desliga").toFloat();
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BOMBA_RELE_PIN, OUTPUT);
+  digitalWrite(BOMBA_RELE_PIN, HIGH);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Conectando ao WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  server.on("/", handleRoot);
+  server.on("/dados", handleDados);
+  server.on("/set", handleSet);
+
+  server.begin();
+
+  Serial.println("Servidor iniciado!");
+}
+
+
+void loop() {
+  server.handleClient();
+
+  unsigned long agora = millis();
+
+  if (agora - tempoAnterior >= intervaloLeitura) {
+    tempoAnterior = agora;
+
+    atualizarSolo();
+    controleIrrigacao();
+
+    Serial.print("Umidade: ");
+    Serial.print(umidadeSoloAtual);
+    Serial.print("% | Bomba: ");
+    Serial.println(estadoBomba ? "LIGADA" : "DESLIGADA");
+  }
+}
